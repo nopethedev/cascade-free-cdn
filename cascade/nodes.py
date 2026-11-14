@@ -419,6 +419,28 @@ class LocalConnector(Connector):
 
 _FB_TOKENS: dict[str, tuple[str, float]] = {}
 _FB_DOWNLOAD_STYLE: dict[str, str] = {}
+_FB_API_STYLE: dict[str, str] = {}
+_FB_SOURCES: dict[str, str] = {}
+
+
+def _quantum_source_name(data: Any) -> str:
+    """Pull a source name from either Quantum source-settings response shape."""
+    if isinstance(data, dict):
+        sources = data.get("sources")
+        if isinstance(sources, list):
+            return _quantum_source_name(sources)
+        for key in data:
+            name = str(key or "").strip()
+            if name and name not in {"status", "message", "token"}:
+                return name
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("name") or "").strip()
+            if name:
+                return name
+    return ""
 
 
 def _http_error_message(response: httpx.Response, fallback: str) -> str:
@@ -454,6 +476,19 @@ class FileBrowserConnector(Connector):
     def _auth_headers(self, token: str) -> dict[str, str]:
         return {"X-Auth": token, "Authorization": f"Bearer {token}"}
 
+    @staticmethod
+    def _token_from_response(response: httpx.Response) -> str:
+        text = (response.text or "").strip()
+        try:
+            data = response.json()
+            if isinstance(data, str):
+                return data.strip()
+            if isinstance(data, dict):
+                return str(data.get("token") or data.get("jwt") or "").strip()
+        except ValueError:
+            pass
+        return text.strip('"').strip()
+
     async def _login(self, client: httpx.AsyncClient, force: bool = False) -> str:
         base = self._base()
         cached = _FB_TOKENS.get(base)
@@ -467,42 +502,90 @@ class FileBrowserConnector(Connector):
                 _FB_TOKENS[base] = (token, time.time() + 3600)
                 return token
             raise NodeError("FileBrowser username and password are required")
+
+        # Original FileBrowser exposes /api/login. Quantum v2 moved password
+        # login to /api/auth/login with the password in an X-Password header.
         try:
-            response = await client.post(
+            legacy = await client.post(
                 "/api/login", json={"username": username, "password": password}
             )
         except httpx.HTTPError as exc:
             raise NodeError(f"cannot reach FileBrowser: {exc}") from exc
-        if response.status_code >= 400:
-            raise NodeError(f"FileBrowser login failed: {_http_error_message(response, 'check credentials')}")
-        text = (response.text or "").strip()
-        token = ""
+        legacy_error = ""
+        if legacy.status_code < 400:
+            token = self._token_from_response(legacy)
+            if token:
+                _FB_API_STYLE[base] = "legacy"
+                _FB_TOKENS[base] = (token, time.time() + 6 * 3600)
+                return token
+            legacy_error = "the legacy login endpoint returned no token"
+        elif legacy.status_code in (401, 403, 429) or legacy.status_code >= 500:
+            raise NodeError(
+                "FileBrowser login failed: "
+                + _http_error_message(legacy, "check credentials")
+            )
+
         try:
-            data = response.json()
-            if isinstance(data, str):
-                token = data
-            elif isinstance(data, dict):
-                token = str(data.get("token") or data.get("jwt") or "")
-        except ValueError:
-            token = text.strip('"')
+            quantum = await client.post(
+                "/api/auth/login",
+                params={"username": username},
+                headers={"X-Password": quote(password, safe="")},
+            )
+        except httpx.HTTPError as exc:
+            raise NodeError(f"cannot reach FileBrowser: {exc}") from exc
+        if quantum.status_code >= 400:
+            detail = _http_error_message(quantum, "check credentials")
+            if legacy_error:
+                detail = f"{detail}; {legacy_error}"
+            raise NodeError(f"FileBrowser login failed: {detail}")
+        token = self._token_from_response(quantum)
         if not token:
             raise NodeError("FileBrowser login returned no token")
-        _FB_TOKENS[base] = (token, time.time() + 6 * 3600)
+        _FB_API_STYLE[base] = "quantum"
+        # Quantum session tokens are shorter-lived than legacy JWTs. Re-login
+        # well before the usual expiry so uploads do not start with a dead token.
+        _FB_TOKENS[base] = (token, time.time() + 50 * 60)
         return token
+
+    async def _quantum_source(self, client: httpx.AsyncClient, token: str) -> str:
+        configured = str(self.config.get("source") or "").strip()
+        if configured:
+            return configured
+        base = self._base()
+        cached = _FB_SOURCES.get(base)
+        if cached:
+            return cached
+        for url, params in (
+            ("/api/settings/sources", None),
+            ("/api/settings", {"property": "sources"}),
+        ):
+            try:
+                response = await self._api_get(client, url, token, params=params)
+            except httpx.HTTPError:
+                continue
+            if response.status_code >= 400:
+                continue
+            try:
+                name = _quantum_source_name(response.json())
+            except ValueError:
+                continue
+            if name:
+                _FB_SOURCES[base] = name
+                return name
+        return ""
 
     async def ping(self) -> tuple[bool, str]:
         try:
             async with self._client(timeout=15) as client:
-                try:
-                    response = await client.get("/health")
-                    if response.status_code < 400:
-                        return True, "healthy"
-                except httpx.HTTPError:
-                    pass
                 token = await self._login(client)
-                response = await client.get(
-                    "/api/resources/", headers=self._auth_headers(token)
-                )
+                if _FB_API_STYLE.get(self._base()) == "quantum":
+                    source = await self._quantum_source(client, token)
+                    params = {"path": "/"}
+                    if source:
+                        params["source"] = source
+                    response = await self._api_get(client, "/api/resources", token, params=params)
+                else:
+                    response = await self._api_get(client, "/api/resources/", token)
                 if response.status_code < 400:
                     return True, "API reachable"
                 return False, _http_error_message(response, f"HTTP {response.status_code}")
@@ -511,11 +594,17 @@ class FileBrowserConnector(Connector):
         except httpx.HTTPError as exc:
             return False, str(exc)
 
-    async def _api_get(self, client: httpx.AsyncClient, url: str, token: str) -> httpx.Response:
-        response = await client.get(url, headers=self._auth_headers(token))
+    async def _api_get(
+        self,
+        client: httpx.AsyncClient,
+        url: str,
+        token: str,
+        params: dict[str, str] | None = None,
+    ) -> httpx.Response:
+        response = await client.get(url, headers=self._auth_headers(token), params=params)
         if response.status_code == 401:
             token = await self._login(client, force=True)
-            response = await client.get(url, headers=self._auth_headers(token))
+            response = await client.get(url, headers=self._auth_headers(token), params=params)
         return response
 
     async def list(self, path: str) -> list[FileItem]:
@@ -524,7 +613,14 @@ class FileBrowserConnector(Connector):
         try:
             async with self._client() as client:
                 token = await self._login(client)
-                response = await self._api_get(client, f"/api/resources{encoded}", token)
+                if _FB_API_STYLE.get(self._base()) == "quantum":
+                    source = await self._quantum_source(client, token)
+                    params = {"path": path}
+                    if source:
+                        params["source"] = source
+                    response = await self._api_get(client, "/api/resources", token, params=params)
+                else:
+                    response = await self._api_get(client, f"/api/resources{encoded}", token)
         except httpx.HTTPError as exc:
             raise NodeError(f"FileBrowser request failed: {exc}") from exc
         if response.status_code >= 400:
@@ -533,9 +629,22 @@ class FileBrowserConnector(Connector):
             data = response.json()
         except ValueError as exc:
             raise NodeError("FileBrowser returned invalid JSON") from exc
-        raw_items = data.get("items", []) if isinstance(data, dict) else data
-        if not isinstance(raw_items, list):
-            raise NodeError("FileBrowser listing was not a list")
+        if isinstance(data, dict):
+            raw_items = data.get("items")
+            if not isinstance(raw_items, list):
+                # Quantum returns a directory object with folder and file
+                # entries (and some versions separate the two arrays).
+                raw_items = []
+                folders = data.get("folders")
+                files = data.get("files")
+                if isinstance(folders, list):
+                    raw_items.extend(folders)
+                if isinstance(files, list):
+                    raw_items.extend(files)
+        elif isinstance(data, list):
+            raw_items = data
+        else:
+            raw_items = []
         items: list[FileItem] = []
         for item in raw_items:
             if not isinstance(item, dict):
@@ -544,7 +653,8 @@ class FileBrowserConnector(Connector):
             if not name:
                 continue
             item_path = str(item.get("path") or join_path(path, name))
-            is_dir = bool(item.get("isDir")) or item.get("type") in ("directory", "dir")
+            item_type = str(item.get("type") or "").lower()
+            is_dir = bool(item.get("isDir")) or item_type in ("directory", "dir", "folder")
             try:
                 size = int(item.get("size") or 0)
             except (TypeError, ValueError):
@@ -566,22 +676,39 @@ class FileBrowserConnector(Connector):
         path = normalize_path(path)
         encoded = quote(path, safe="/")
         base = self._base()
-        style = _FB_DOWNLOAD_STYLE.get(base)
-        candidates: list[tuple[str, str]] = []
-        if style != "resources":
-            candidates.append(("raw", f"/api/raw{encoded}"))
-        candidates.append(
-            ("resources", f"/api/resources/download?path={quote(path, safe='')}&inline=true")
-        )
-        candidates.append(("resources_path", f"/api/resources/download{encoded}"))
-        if style == "resources":
-            candidates.sort(key=lambda item: 0 if item[0].startswith("resources") else 1)
-
         client = self._client()
         token = ""
         last_error = "download failed"
         try:
             token = await self._login(client)
+            if _FB_API_STYLE.get(base) == "quantum":
+                source = await self._quantum_source(client, token)
+                query = f"file={quote(path, safe='')}"
+                if source:
+                    query += f"&source={quote(source, safe='')}"
+                candidates = [
+                    ("resources", f"/api/resources/download?{query}"),
+                    (
+                        "resources_path",
+                        f"/api/resources/download?path={quote(path, safe='')}&inline=true",
+                    ),
+                ]
+            else:
+                download_style = _FB_DOWNLOAD_STYLE.get(base)
+                candidates = []
+                if download_style != "resources":
+                    candidates.append(("raw", f"/api/raw{encoded}"))
+                candidates.append(
+                    (
+                        "resources",
+                        f"/api/resources/download?path={quote(path, safe='')}&inline=true",
+                    )
+                )
+                candidates.append(("resources_path", f"/api/resources/download{encoded}"))
+                if download_style == "resources":
+                    candidates.sort(
+                        key=lambda item: 0 if item[0].startswith("resources") else 1
+                    )
             for _attempt in range(2):
                 for label, url in candidates:
                     headers = self._auth_headers(token)
@@ -667,6 +794,30 @@ class FileBrowserConnector(Connector):
         directory, filename = split_name(path)
         if not filename:
             raise NodeError("upload needs a file name")
+        if _FB_API_STYLE.get(self._base()) == "quantum":
+            content_type = mime or guess_mime(filename) or "application/octet-stream"
+            try:
+                async with self._client(timeout=3600) as client:
+                    token = await self._login(client)
+                    source = await self._quantum_source(client, token)
+                    params = {"path": path, "override": "true"}
+                    if source:
+                        params["source"] = source
+                    headers = {**self._auth_headers(token), "Content-Type": content_type}
+                    if size is not None:
+                        headers["Content-Length"] = str(size)
+                    response = await client.post(
+                        "/api/resources", params=params, headers=headers, content=body
+                    )
+            except httpx.HTTPError as exc:
+                raise NodeError(f"upload failed: {exc}") from exc
+            if response.status_code >= 400:
+                raise NodeError(
+                    "FileBrowser upload failed: "
+                    + _http_error_message(response, str(response.status_code))
+                )
+            return size if size is not None else 0
+
         boundary = "cascade" + secrets.token_hex(12)
         stream = _MultipartStream(boundary, "files", filename, body, size, mime)
         headers = {
@@ -696,10 +847,41 @@ class FileBrowserConnector(Connector):
         try:
             async with self._client() as client:
                 token = await self._login(client)
-                url = f"/api/resources{quote(path, safe='/')}/"
-                response = await client.post(url, headers=self._auth_headers(token), content=b"")
-                if response.status_code in (404, 405):
-                    response = await client.put(url, headers=self._auth_headers(token), content=b"")
+                if _FB_API_STYLE.get(self._base()) == "quantum":
+                    source = await self._quantum_source(client, token)
+                    params = {"path": path, "isDir": "true"}
+                    if source:
+                        params["source"] = source
+                    response = await client.post(
+                        "/api/resources",
+                        params=params,
+                        headers=self._auth_headers(token),
+                        content=b"",
+                    )
+                    if response.status_code == 401:
+                        token = await self._login(client, force=True)
+                        response = await client.post(
+                            "/api/resources",
+                            params=params,
+                            headers=self._auth_headers(token),
+                            content=b"",
+                        )
+                    if response.status_code in (400, 404, 405):
+                        # Quantum before v1.2 inferred a folder from a trailing
+                        # slash; keep that shape as a compatibility fallback.
+                        params.pop("isDir", None)
+                        params["path"] = path.rstrip("/") + "/"
+                        response = await client.post(
+                            "/api/resources",
+                            params=params,
+                            headers=self._auth_headers(token),
+                            content=b"",
+                        )
+                else:
+                    url = f"/api/resources{quote(path, safe='/')}/"
+                    response = await client.post(url, headers=self._auth_headers(token), content=b"")
+                    if response.status_code in (404, 405):
+                        response = await client.put(url, headers=self._auth_headers(token), content=b"")
         except httpx.HTTPError as exc:
             raise NodeError(f"mkdir failed: {exc}") from exc
         if response.status_code >= 400:
@@ -710,9 +892,24 @@ class FileBrowserConnector(Connector):
         try:
             async with self._client() as client:
                 token = await self._login(client)
-                response = await client.delete(
-                    f"/api/resources{quote(path, safe='/')}", headers=self._auth_headers(token)
-                )
+                if _FB_API_STYLE.get(self._base()) == "quantum":
+                    source = await self._quantum_source(client, token)
+                    params = {"path": path}
+                    if source:
+                        params["source"] = source
+                    response = await client.delete(
+                        "/api/resources", params=params, headers=self._auth_headers(token)
+                    )
+                    if response.status_code == 401:
+                        token = await self._login(client, force=True)
+                        response = await client.delete(
+                            "/api/resources", params=params, headers=self._auth_headers(token)
+                        )
+                else:
+                    response = await client.delete(
+                        f"/api/resources{quote(path, safe='/')}",
+                        headers=self._auth_headers(token),
+                    )
         except httpx.HTTPError as exc:
             raise NodeError(f"delete failed: {exc}") from exc
         if response.status_code >= 400:
@@ -721,15 +918,45 @@ class FileBrowserConnector(Connector):
     async def rename(self, path: str, new_path: str) -> None:
         path = normalize_path(path)
         new_path = normalize_path(new_path)
-        payload = {"action": "rename", "destination": new_path, "override": False}
         try:
             async with self._client() as client:
                 token = await self._login(client)
-                response = await client.patch(
-                    f"/api/resources{quote(path, safe='/')}",
-                    headers={**self._auth_headers(token), "Content-Type": "application/json"},
-                    json=payload,
-                )
+                if _FB_API_STYLE.get(self._base()) == "quantum":
+                    source = await self._quantum_source(client, token)
+                    item = {"fromPath": path, "toPath": new_path}
+                    if source:
+                        item["fromSource"] = source
+                        item["toSource"] = source
+                    payload = {"action": "rename", "items": [item], "overwrite": False}
+                    response = await client.patch(
+                        "/api/resources",
+                        headers={**self._auth_headers(token), "Content-Type": "application/json"},
+                        json=payload,
+                    )
+                    if response.status_code == 401:
+                        token = await self._login(client, force=True)
+                        response = await client.patch(
+                            "/api/resources",
+                            headers={
+                                **self._auth_headers(token),
+                                "Content-Type": "application/json",
+                            },
+                            json=payload,
+                        )
+                else:
+                    payload = {
+                        "action": "rename",
+                        "destination": new_path,
+                        "override": False,
+                    }
+                    response = await client.patch(
+                        f"/api/resources{quote(path, safe='/')}",
+                        headers={
+                            **self._auth_headers(token),
+                            "Content-Type": "application/json",
+                        },
+                        json=payload,
+                    )
         except httpx.HTTPError as exc:
             raise NodeError(f"rename failed: {exc}") from exc
         if response.status_code >= 400:
@@ -2471,6 +2698,12 @@ NODE_KINDS: dict[str, dict[str, Any]] = {
             {"key": "base_url", "label": "Base URL", "placeholder": "https://files.example.com", "required": True},
             {"key": "username", "label": "Username", "placeholder": "admin", "required": True},
             {"key": "password", "label": "Password", "type": "password", "required": True},
+            {
+                "key": "source",
+                "label": "Source name",
+                "placeholder": "files",
+                "help": "FileBrowser Quantum only. Leave blank to use the first source the server reports.",
+            },
         ],
     },
     "webdav": {

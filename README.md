@@ -12,7 +12,7 @@ admin   ── /admin    ──► nodes · files · links · replication · peo
 
 - One short id, two delivery modes. `/s/` is a real proxy with byte-range passthrough (video seeking works). `/f/` is a 302 to the resolved direct URL, so the upstream CDN carries the transfer. Every link exposes both; the link's `mode` only decides what the bare `/{id}` does.
 - Cloud share pages become direct URLs. Dropbox share links are rewritten to `dl.dropboxusercontent.com`, Google Drive goes through its confirm/uuid flow, TeraBox is handled with a page-API resolver plus a yt-dlp fallback, and any unknown host is probed and optionally handed to `yt-dlp`.
-- FileBrowser and FileBrowser Quantum are first-class nodes: login, browse, upload, mkdir, rename, delete, download. The Quantum v2 move from `/api/raw` to `/api/resources/download` is handled by trying both routes and remembering which one works.
+- FileBrowser and FileBrowser Quantum are first-class nodes: login, browse, upload, mkdir, rename, delete, download. Cascade detects the legacy API and Quantum's v2 API, including Quantum sources and its raw upload and download routes.
 - S3-compatible storage (AWS S3, Cloudflare R2, Backblaze B2, MinIO) and WebDAV (Nextcloud, ownCloud) are writable nodes. S3 forwarding uses short-lived presigned URLs; WebDAV streams through Cascade.
 - Replication is a background job with live byte progress. Copy local → FileBrowser, FileBrowser → local, local → local, and so on.
 - Multi-user with a clear split: admins manage nodes/files/settings; regular users browse read-only, download and create their own links.
@@ -69,7 +69,7 @@ A node is one place files can live. Add one under **Nodes → Add node**: choose
 | Kind | Browse | Stream | Upload | Notes |
 | --- | --- | --- | --- | --- |
 | Local disk | yes | yes | yes | A folder inside `data/files/`. Range requests are native. |
-| FileBrowser / Quantum | yes | yes | yes | REST API. Needs a user with browse + create permissions. |
+| FileBrowser / Quantum | yes | yes | yes | REST API. Needs a user with browse, download and create permissions. |
 | S3-compatible | yes | yes | yes | AWS S3, R2, B2, MinIO. Forward links use 1-hour presigned URLs. |
 | WebDAV | yes | yes | yes | Nextcloud, ownCloud or any WebDAV folder. |
 | Dropbox | yes | yes | yes | OAuth sign-in or a manual access token. Share links work without a token via the dl. rewrite. |
@@ -80,7 +80,7 @@ A node is one place files can live. Add one under **Nodes → Add node**: choose
 
 ### FileBrowser / FileBrowser Quantum
 
-Point the node at the instance root, e.g. `https://files.example.com`, and give the username/password of a FileBrowser user. Cascade calls `POST /api/login`, then uses `/api/resources` for browsing, upload and mkdir, `/api/raw` or `/api/resources/download` for downloads, `PATCH /api/resources/...` with `action: rename` for moves, and `DELETE` for deletion. Quantum's v2 API is detected automatically; if downloads fail, make sure the account has download permission for the configured source.
+Point the node at the instance root, e.g. `https://files.example.com`, and give the username/password of a FileBrowser user. Cascade detects the API automatically. Legacy FileBrowser uses `POST /api/login` and path-based `/api/resources/...` calls. FileBrowser Quantum v2 uses `POST /api/auth/login` with `X-Password`, query-based `/api/resources?path=...&source=...` calls, raw uploads, `isDir` folder creation, a JSON rename payload, and `/api/resources/download?source=...&file=...` downloads. Quantum sources are discovered from `/api/settings/sources`; if the account can see more than one, set **Source name** on the node. Make sure the account has browse, download and create permissions for that source.
 
 ### S3-compatible object storage
 
