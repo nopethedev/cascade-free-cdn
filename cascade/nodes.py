@@ -479,29 +479,35 @@ class FileBrowserConnector(Connector):
     @staticmethod
     def _token_from_response(response: httpx.Response) -> str:
         text = (response.text or "").strip()
+        token = ""
         try:
             data = response.json()
-            if isinstance(data, str):
-                return data.strip()
-            if isinstance(data, dict):
-                return str(data.get("token") or data.get("jwt") or "").strip()
         except ValueError:
-            pass
-        return text.strip('"').strip()
+            token = text
+        else:
+            if isinstance(data, str):
+                token = data
+            elif isinstance(data, dict):
+                token = str(data.get("token") or data.get("jwt") or "")
+        token = token.strip().strip('"').strip()
+        if len(token) > 8192 or any(char in token for char in "<>\n\r"):
+            return ""
+        return token
 
     async def _login(self, client: httpx.AsyncClient, force: bool = False) -> str:
         base = self._base()
+        api_token = str(self.config.get("token") or "").strip()
+        if api_token:
+            # API tokens are long-lived and tied to this node's configuration.
+            # Do not share them through the per-URL session-token cache.
+            return api_token
         cached = _FB_TOKENS.get(base)
         if cached and not force and cached[1] > time.time():
             return cached[0]
         username = str(self.config.get("username") or "")
         password = str(self.config.get("password") or "")
         if not username or not password:
-            token = str(self.config.get("token") or "").strip()
-            if token:
-                _FB_TOKENS[base] = (token, time.time() + 3600)
-                return token
-            raise NodeError("FileBrowser username and password are required")
+            raise NodeError("FileBrowser username and password, or an API token, are required")
 
         # Original FileBrowser exposes /api/login. Quantum v2 moved password
         # login to /api/auth/login with the password in an X-Password header.
@@ -547,6 +553,55 @@ class FileBrowserConnector(Connector):
         _FB_TOKENS[base] = (token, time.time() + 50 * 60)
         return token
 
+    async def _api_style(self, client: httpx.AsyncClient, token: str) -> str:
+        """Detect legacy versus Quantum when an API token bypasses login."""
+        base = self._base()
+        style = _FB_API_STYLE.get(base)
+        if style:
+            return style
+        try:
+            response = await self._api_get(client, "/api/settings/sources", token)
+        except httpx.HTTPError:
+            response = None
+        if response is not None:
+            if response.status_code < 400:
+                try:
+                    data = response.json()
+                except ValueError:
+                    data = None
+                if isinstance(data, (dict, list)):
+                    _FB_API_STYLE[base] = "quantum"
+                    name = _quantum_source_name(data)
+                    if name:
+                        _FB_SOURCES[base] = name
+                    return "quantum"
+        try:
+            probe = await self._api_get(client, "/api/resources", token, params={"path": "/"})
+        except httpx.HTTPError:
+            probe = None
+        if probe is not None and probe.status_code < 400:
+            try:
+                data = probe.json()
+            except ValueError:
+                data = None
+            # Legacy FileBrowser serves a directory object with an "items"
+            # array (often after redirecting to /api/resources/). Quantum
+            # returns its folder directly with files/folders arrays.
+            if isinstance(data, dict) and ("files" in data or "folders" in data):
+                _FB_API_STYLE[base] = "quantum"
+                return "quantum"
+            if isinstance(data, dict) and "items" in data:
+                _FB_API_STYLE[base] = "legacy"
+                return "legacy"
+            if isinstance(data, list) or str(probe.url.path).endswith("/api/resources/"):
+                _FB_API_STYLE[base] = "legacy"
+                return "legacy"
+        if probe is not None and probe.status_code in (404, 405):
+            _FB_API_STYLE[base] = "legacy"
+            return "legacy"
+        _FB_API_STYLE[base] = "quantum" if probe is not None and probe.status_code < 400 else "legacy"
+        return _FB_API_STYLE[base]
+
     async def _quantum_source(self, client: httpx.AsyncClient, token: str) -> str:
         configured = str(self.config.get("source") or "").strip()
         if configured:
@@ -578,7 +633,8 @@ class FileBrowserConnector(Connector):
         try:
             async with self._client(timeout=15) as client:
                 token = await self._login(client)
-                if _FB_API_STYLE.get(self._base()) == "quantum":
+                style = await self._api_style(client, token)
+                if style == "quantum":
                     source = await self._quantum_source(client, token)
                     params = {"path": "/"}
                     if source:
@@ -613,7 +669,8 @@ class FileBrowserConnector(Connector):
         try:
             async with self._client() as client:
                 token = await self._login(client)
-                if _FB_API_STYLE.get(self._base()) == "quantum":
+                style = await self._api_style(client, token)
+                if style == "quantum":
                     source = await self._quantum_source(client, token)
                     params = {"path": path}
                     if source:
@@ -681,7 +738,8 @@ class FileBrowserConnector(Connector):
         last_error = "download failed"
         try:
             token = await self._login(client)
-            if _FB_API_STYLE.get(base) == "quantum":
+            style = await self._api_style(client, token)
+            if style == "quantum":
                 source = await self._quantum_source(client, token)
                 query = f"file={quote(path, safe='')}"
                 if source:
@@ -794,60 +852,56 @@ class FileBrowserConnector(Connector):
         directory, filename = split_name(path)
         if not filename:
             raise NodeError("upload needs a file name")
-        if _FB_API_STYLE.get(self._base()) == "quantum":
-            content_type = mime or guess_mime(filename) or "application/octet-stream"
-            try:
-                async with self._client(timeout=3600) as client:
-                    token = await self._login(client)
-                    source = await self._quantum_source(client, token)
-                    params = {"path": path, "override": "true"}
-                    if source:
-                        params["source"] = source
-                    headers = {**self._auth_headers(token), "Content-Type": content_type}
-                    if size is not None:
-                        headers["Content-Length"] = str(size)
-                    response = await client.post(
-                        "/api/resources", params=params, headers=headers, content=body
-                    )
-            except httpx.HTTPError as exc:
-                raise NodeError(f"upload failed: {exc}") from exc
+        client = self._client(timeout=3600)
+        try:
+            token = await self._login(client)
+            style = await self._api_style(client, token)
+            if style == "quantum":
+                source = await self._quantum_source(client, token)
+                params = {"path": path, "override": "true"}
+                if source:
+                    params["source"] = source
+                headers = {
+                    **self._auth_headers(token),
+                    "Content-Type": mime or guess_mime(filename) or "application/octet-stream",
+                }
+                if size is not None:
+                    headers["Content-Length"] = str(size)
+                response = await client.post(
+                    "/api/resources", params=params, headers=headers, content=body
+                )
+            else:
+                boundary = "cascade" + secrets.token_hex(12)
+                stream = _MultipartStream(boundary, "files", filename, body, size, mime)
+                headers = {
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                }
+                length = stream.length()
+                if length is not None:
+                    headers["Content-Length"] = str(length)
+                response = await client.post(
+                    f"/api/resources{quote(directory, safe='/')}?override=true",
+                    headers={**self._auth_headers(token), **headers},
+                    content=stream,
+                )
             if response.status_code >= 400:
                 raise NodeError(
                     "FileBrowser upload failed: "
                     + _http_error_message(response, str(response.status_code))
                 )
             return size if size is not None else 0
-
-        boundary = "cascade" + secrets.token_hex(12)
-        stream = _MultipartStream(boundary, "files", filename, body, size, mime)
-        headers = {
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        }
-        length = stream.length()
-        if length is not None:
-            headers["Content-Length"] = str(length)
-        try:
-            async with self._client(timeout=3600) as client:
-                token = await self._login(client)
-                url = f"/api/resources{quote(directory, safe='/')}?override=true"
-                response = await client.post(url, headers={**self._auth_headers(token), **headers}, content=stream)
-                if response.status_code == 401:
-                    token = await self._login(client, force=True)
-                    response = await client.post(
-                        url, headers={**self._auth_headers(token), **headers}, content=stream
-                    )
         except httpx.HTTPError as exc:
             raise NodeError(f"upload failed: {exc}") from exc
-        if response.status_code >= 400:
-            raise NodeError(f"FileBrowser upload failed: {_http_error_message(response, str(response.status_code))}")
-        return size if size is not None else 0
+        finally:
+            await client.aclose()
 
     async def mkdir(self, path: str) -> None:
         path = normalize_path(path)
         try:
             async with self._client() as client:
                 token = await self._login(client)
-                if _FB_API_STYLE.get(self._base()) == "quantum":
+                style = await self._api_style(client, token)
+                if style == "quantum":
                     source = await self._quantum_source(client, token)
                     params = {"path": path, "isDir": "true"}
                     if source:
@@ -892,7 +946,8 @@ class FileBrowserConnector(Connector):
         try:
             async with self._client() as client:
                 token = await self._login(client)
-                if _FB_API_STYLE.get(self._base()) == "quantum":
+                style = await self._api_style(client, token)
+                if style == "quantum":
                     source = await self._quantum_source(client, token)
                     params = {"path": path}
                     if source:
@@ -921,7 +976,8 @@ class FileBrowserConnector(Connector):
         try:
             async with self._client() as client:
                 token = await self._login(client)
-                if _FB_API_STYLE.get(self._base()) == "quantum":
+                style = await self._api_style(client, token)
+                if style == "quantum":
                     source = await self._quantum_source(client, token)
                     item = {"fromPath": path, "toPath": new_path}
                     if source:
@@ -2696,8 +2752,24 @@ NODE_KINDS: dict[str, dict[str, Any]] = {
         "blurb": "Bridge a FileBrowser or FileBrowser Quantum instance over its REST API.",
         "fields": [
             {"key": "base_url", "label": "Base URL", "placeholder": "https://files.example.com", "required": True},
-            {"key": "username", "label": "Username", "placeholder": "admin", "required": True},
-            {"key": "password", "label": "Password", "type": "password", "required": True},
+            {
+                "key": "username",
+                "label": "Username",
+                "placeholder": "admin",
+                "help": "Required with the password unless you use an API token.",
+            },
+            {
+                "key": "password",
+                "label": "Password",
+                "type": "password",
+                "help": "Required with the username unless you use an API token.",
+            },
+            {
+                "key": "token",
+                "label": "API token",
+                "type": "password",
+                "help": "Optional. Create one in FileBrowser Quantum under Settings → API Management. Use instead of username and password.",
+            },
             {
                 "key": "source",
                 "label": "Source name",

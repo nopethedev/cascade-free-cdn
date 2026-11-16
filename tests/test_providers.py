@@ -27,6 +27,39 @@ def test_new_providers_appear_in_the_nodes_dialog(panel):
         assert label in response.text
     assert "Adding a node" in response.text
     assert "Required fields are marked" in response.text
+    assert "API token" in response.text
+
+
+def test_filebrowser_accepts_api_token_without_password(panel):
+    response = panel.post(
+        "/api/nodes",
+        json={
+            "name": "Quantum",
+            "kind": "filebrowser",
+            "config": {
+                "base_url": "https://quantum.example.com",
+                "token": "quantum-api-key",
+                "source": "media",
+            },
+        },
+    )
+    assert response.status_code == 200, response.text
+    node = response.json()["node"]
+    assert node["secrets"]["token"] is True
+    assert "token" not in node["config"]
+
+
+def test_filebrowser_requires_credentials_or_token(panel):
+    response = panel.post(
+        "/api/nodes",
+        json={
+            "name": "Quantum",
+            "kind": "filebrowser",
+            "config": {"base_url": "https://quantum.example.com"},
+        },
+    )
+    assert response.status_code == 400
+    assert "API token" in response.text
 
 
 def test_s3_requires_bucket_and_credentials(panel):
@@ -250,6 +283,184 @@ def test_filebrowser_quantum_uses_v2_auth_resources_and_source(monkeypatch):
 
     try:
         asyncio.run(scenario())
+    finally:
+        for cache in (
+            nodes_module._FB_TOKENS,
+            nodes_module._FB_DOWNLOAD_STYLE,
+            nodes_module._FB_API_STYLE,
+            nodes_module._FB_SOURCES,
+        ):
+            cache.pop(base, None)
+
+
+def test_filebrowser_quantum_api_token_skips_login(monkeypatch):
+    from cascade import nodes as nodes_module
+
+    base = "https://quantum-token.test"
+    for cache in (
+        nodes_module._FB_TOKENS,
+        nodes_module._FB_DOWNLOAD_STYLE,
+        nodes_module._FB_API_STYLE,
+        nodes_module._FB_SOURCES,
+    ):
+        cache.pop(base, None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path not in ("/api/login", "/api/auth/login")
+        assert request.headers["authorization"] == "Bearer quantum-api-key"
+        if request.url.path == "/api/settings/sources":
+            return httpx.Response(200, json={"media": {"used": 1}})
+        if request.url.path == "/api/resources":
+            assert request.url.params["path"] == "/"
+            assert request.url.params["source"] == "media"
+            return httpx.Response(
+                200,
+                json={"files": [{"name": "token.txt", "type": "blob", "size": 3}]},
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    connector = FileBrowserConnector(
+        _row(
+            "filebrowser",
+            {
+                "base_url": base,
+                "token": "quantum-api-key",
+            },
+        )
+    )
+
+    def fake_client(timeout=30.0):
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url=base,
+            timeout=httpx.Timeout(timeout, connect=15.0, read=None),
+        )
+
+    monkeypatch.setattr(connector, "_client", fake_client)
+    try:
+        items = asyncio.run(connector.list("/"))
+        assert [(item.name, item.size) for item in items] == [("token.txt", 3)]
+        assert nodes_module._FB_API_STYLE[base] == "quantum"
+        assert nodes_module._FB_SOURCES[base] == "media"
+    finally:
+        for cache in (
+            nodes_module._FB_TOKENS,
+            nodes_module._FB_DOWNLOAD_STYLE,
+            nodes_module._FB_API_STYLE,
+            nodes_module._FB_SOURCES,
+        ):
+            cache.pop(base, None)
+
+
+def test_filebrowser_api_token_detects_legacy_api(monkeypatch):
+    from cascade import nodes as nodes_module
+
+    base = "https://legacy-token.test"
+    for cache in (
+        nodes_module._FB_TOKENS,
+        nodes_module._FB_DOWNLOAD_STYLE,
+        nodes_module._FB_API_STYLE,
+        nodes_module._FB_SOURCES,
+    ):
+        cache.pop(base, None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path not in ("/api/login", "/api/auth/login")
+        assert request.headers["authorization"] == "Bearer legacy-api-key"
+        if request.url.path == "/api/settings/sources":
+            return httpx.Response(404)
+        if request.url.path == "/api/resources":
+            assert request.url.params["path"] == "/"
+            return httpx.Response(200, json={"items": []})
+        if request.url.path == "/api/resources/":
+            return httpx.Response(
+                200,
+                json={"items": [{"name": "old.txt", "path": "/old.txt", "size": 3}]},
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    connector = FileBrowserConnector(
+        _row(
+            "filebrowser",
+            {
+                "base_url": base,
+                "token": "legacy-api-key",
+            },
+        )
+    )
+
+    def fake_client(timeout=30.0):
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url=base,
+            timeout=httpx.Timeout(timeout, connect=15.0, read=None),
+        )
+
+    monkeypatch.setattr(connector, "_client", fake_client)
+    try:
+        items = asyncio.run(connector.list("/"))
+        assert [(item.name, item.path) for item in items] == [("old.txt", "/old.txt")]
+        assert nodes_module._FB_API_STYLE[base] == "legacy"
+        assert base not in nodes_module._FB_TOKENS
+    finally:
+        for cache in (
+            nodes_module._FB_TOKENS,
+            nodes_module._FB_DOWNLOAD_STYLE,
+            nodes_module._FB_API_STYLE,
+            nodes_module._FB_SOURCES,
+        ):
+            cache.pop(base, None)
+
+
+def test_filebrowser_quantum_falls_back_when_legacy_login_returns_html(monkeypatch):
+    from cascade import nodes as nodes_module
+
+    base = "https://quantum-html-login.test"
+    for cache in (
+        nodes_module._FB_TOKENS,
+        nodes_module._FB_DOWNLOAD_STYLE,
+        nodes_module._FB_API_STYLE,
+        nodes_module._FB_SOURCES,
+    ):
+        cache.pop(base, None)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/api/login":
+            return httpx.Response(200, text="<!doctype html><title>FileBrowser</title>")
+        if request.url.path == "/api/auth/login":
+            return httpx.Response(200, text="quantum-token")
+        if request.url.path == "/api/settings/sources":
+            return httpx.Response(200, json={"media": {"used": 1}})
+        if request.url.path == "/api/resources":
+            return httpx.Response(
+                200,
+                json={"files": [{"name": "quantum.txt", "type": "blob", "size": 7}]},
+            )
+        raise AssertionError(f"unexpected request: {request.method} {request.url}")
+
+    connector = FileBrowserConnector(
+        _row(
+            "filebrowser",
+            {
+                "base_url": base,
+                "username": "admin",
+                "password": "secret",
+            },
+        )
+    )
+
+    def fake_client(timeout=30.0):
+        return httpx.AsyncClient(
+            transport=httpx.MockTransport(handler),
+            base_url=base,
+            timeout=httpx.Timeout(timeout, connect=15.0, read=None),
+        )
+
+    monkeypatch.setattr(connector, "_client", fake_client)
+    try:
+        items = asyncio.run(connector.list("/"))
+        assert [(item.name, item.size) for item in items] == [("quantum.txt", 7)]
+        assert nodes_module._FB_API_STYLE[base] == "quantum"
     finally:
         for cache in (
             nodes_module._FB_TOKENS,

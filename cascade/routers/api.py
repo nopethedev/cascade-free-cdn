@@ -115,6 +115,14 @@ def _validate_config(kind: str, config: Any, *, require_fields: bool = True) -> 
         base = str(clean.get("base_url") or "")
         if base and not base.startswith(("http://", "https://")):
             raise HTTPException(400, "base URL must start with http:// or https://")
+    if require_fields and kind == "filebrowser":
+        has_token = bool(str(clean.get("token") or "").strip())
+        has_login = bool(
+            str(clean.get("username") or "").strip()
+            and str(clean.get("password") or "").strip()
+        )
+        if not has_token and not has_login:
+            raise HTTPException(400, "Provide a username and password, or an API token")
     if kind == "s3":
         endpoint = str(clean.get("endpoint") or "")
         if endpoint and not endpoint.startswith(("http://", "https://")):

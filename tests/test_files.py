@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 
 from cascade import db
@@ -46,6 +47,35 @@ def test_upload_list_download_mkdir_rename_delete(panel, make_node):
     names = [item["name"] for item in _list(panel, node_id)]
     assert "renamed.txt" not in names
     assert names == ["media"]
+
+
+def test_files_page_has_unified_view_and_location_column(panel, make_node):
+    make_node("Source")
+    response = panel.get("/admin/files")
+    assert response.status_code == 200
+    assert "All nodes · unified view" in response.text
+    assert "<th>Location</th>" in response.text
+    assert "this folder across every node" in response.text
+
+
+def test_files_page_omits_nodes_that_cannot_browse(panel, make_node):
+    make_node("Browsable")
+    make_node("Direct only", kind="http", config={"base_url": "https://cdn.example.com/"})
+    response = panel.get("/admin/files")
+    assert response.status_code == 200
+    match = re.search(r'<select class="select" id="node-select">(.*?)</select>', response.text, re.S)
+    assert match is not None
+    selector = match.group(1)
+    assert "Browsable" in selector
+    assert "Direct only" not in selector
+
+
+def test_files_page_explains_when_no_node_can_browse(panel, make_node):
+    make_node("Direct only", kind="http", config={"base_url": "https://cdn.example.com/"})
+    response = panel.get("/admin/files")
+    assert response.status_code == 200
+    assert "No browsable nodes" in response.text
+    assert "No nodes yet" not in response.text
 
 
 def test_replication_job(panel, make_node):

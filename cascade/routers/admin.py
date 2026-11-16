@@ -117,23 +117,25 @@ async def dashboard(request: Request, auth: Auth = Depends(require_auth)):
 @router.get("/files")
 async def files_page(request: Request, auth: Auth = Depends(require_auth)):
     node_rows = _nodes_with_caps()
+    enabled_nodes = []
     browsable = []
     for item in node_rows:
         node = item["node"]
         if not node["enabled"]:
             continue
-        browsable.append(
-            {
-                "id": node["id"],
-                "name": node["name"],
-                "kind": node["kind"],
-                "kind_label": item["kind_label"],
-                "caps": item["caps"],
-            }
-        )
+        entry = {
+            "id": node["id"],
+            "name": node["name"],
+            "kind": node["kind"],
+            "kind_label": item["kind_label"],
+            "caps": item["caps"],
+        }
+        enabled_nodes.append(entry)
+        if "list" in item["caps"]:
+            browsable.append(entry)
     can_write = auth.is_admin
     bootstrap = {
-        "nodes": browsable,
+        "nodes": enabled_nodes,
         "canWrite": can_write,
         "canReplicate": can_write,
         "initialNode": browsable[0]["id"] if browsable else None,
@@ -144,6 +146,7 @@ async def files_page(request: Request, auth: Auth = Depends(require_auth)):
         auth=auth,
         active="files",
         nodes=browsable,
+        has_nodes=bool(enabled_nodes),
         can_write=can_write,
         bootstrap=bootstrap,
     )

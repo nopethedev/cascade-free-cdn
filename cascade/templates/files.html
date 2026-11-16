@@ -1,7 +1,7 @@
 {% extends "base.html" %}
 {% block title %}Files · {{ site_name }}{% endblock %}
 {% block page_title %}Files{% endblock %}
-{% block page_sub %}Browse nodes, publish links and replicate files between hosts.{% endblock %}
+{% block page_sub %}Browse every node, see where files are stored and replicate them between hosts.{% endblock %}
 {% block content %}
 {% if nodes %}
 <section class="card file-shell">
@@ -12,6 +12,7 @@
         {% for node in nodes %}
           <option value="{{ node.id }}" data-caps="{{ node.caps|join(',') }}">{{ node.name }} · {{ node.kind_label }}</option>
         {% endfor %}
+        <option value="all">All nodes · unified view</option>
       </select>
     </label>
     <button class="btn btn-ghost btn-sm" id="btn-up" title="Go to parent folder">
@@ -20,14 +21,14 @@
     <div class="spacer"></div>
     {% if can_write %}
       <input type="file" id="file-input" multiple hidden>
-      <button class="btn" id="btn-upload"><svg class="icon"><use href="#i-upload"/></svg>Upload</button>
-      <button class="btn" id="btn-mkdir"><svg class="icon"><use href="#i-folder-plus"/></svg>New folder</button>
+      <button class="btn" id="btn-upload" data-single-node-only><svg class="icon"><use href="#i-upload"/></svg>Upload</button>
+      <button class="btn" id="btn-mkdir" data-single-node-only><svg class="icon"><use href="#i-folder-plus"/></svg>New folder</button>
     {% endif %}
     <button class="btn btn-ghost" id="btn-refresh"><svg class="icon"><use href="#i-refresh"/></svg>Refresh</button>
   </div>
 
   {% if can_write %}
-  <div class="dropzone" id="dropzone">
+  <div class="dropzone" id="dropzone" data-single-node-only>
     <svg class="icon"><use href="#i-upload"/></svg>
     <span>Drop files here to upload to the current folder</span>
   </div>
@@ -35,18 +36,26 @@
 
   <div class="file-toolbar">
     <nav class="breadcrumb" id="breadcrumb" aria-label="Breadcrumb"></nav>
+    <span class="muted tiny" id="all-nodes-hint" hidden>Unified view: this folder across every node. Choose a single node to upload or edit.</span>
     <span class="muted tiny" id="file-count"></span>
   </div>
 
   <div class="table-wrap">
     <table class="table files-table">
-      <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th class="cell-actions">Actions</th></tr></thead>
+      <thead><tr><th>Name</th><th>Size</th><th>Modified</th><th>Location</th><th class="cell-actions">Actions</th></tr></thead>
       <tbody id="file-rows">
-        <tr><td colspan="4" class="empty-row">Loading…</td></tr>
+        <tr><td colspan="5" class="empty-row">Loading…</td></tr>
       </tbody>
     </table>
   </div>
   <div class="drop-hint" id="upload-status" hidden></div>
+</section>
+{% elif has_nodes %}
+<section class="card empty big">
+  <span class="feature-icon"><svg class="icon"><use href="#i-server"/></svg></span>
+  <h2>No browsable nodes</h2>
+  <p>Your nodes can stream files but do not support folder listings. Add a local, FileBrowser, WebDAV, S3 or cloud-drive node to browse files here.</p>
+  {% if user.role == 'admin' %}<a class="btn btn-primary" href="/admin/nodes">Connect a node</a>{% endif %}
 </section>
 {% else %}
 <section class="card empty big">

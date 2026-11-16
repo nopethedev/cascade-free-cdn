@@ -69,7 +69,7 @@ A node is one place files can live. Add one under **Nodes → Add node**: choose
 | Kind | Browse | Stream | Upload | Notes |
 | --- | --- | --- | --- | --- |
 | Local disk | yes | yes | yes | A folder inside `data/files/`. Range requests are native. |
-| FileBrowser / Quantum | yes | yes | yes | REST API. Needs a user with browse, download and create permissions. |
+| FileBrowser / Quantum | yes | yes | yes | REST API. Use a user with browse, download and create permissions, or a Quantum API token. |
 | S3-compatible | yes | yes | yes | AWS S3, R2, B2, MinIO. Forward links use 1-hour presigned URLs. |
 | WebDAV | yes | yes | yes | Nextcloud, ownCloud or any WebDAV folder. |
 | Dropbox | yes | yes | yes | OAuth sign-in or a manual access token. Share links work without a token via the dl. rewrite. |
@@ -80,7 +80,7 @@ A node is one place files can live. Add one under **Nodes → Add node**: choose
 
 ### FileBrowser / FileBrowser Quantum
 
-Point the node at the instance root, e.g. `https://files.example.com`, and give the username/password of a FileBrowser user. Cascade detects the API automatically. Legacy FileBrowser uses `POST /api/login` and path-based `/api/resources/...` calls. FileBrowser Quantum v2 uses `POST /api/auth/login` with `X-Password`, query-based `/api/resources?path=...&source=...` calls, raw uploads, `isDir` folder creation, a JSON rename payload, and `/api/resources/download?source=...&file=...` downloads. Quantum sources are discovered from `/api/settings/sources`; if the account can see more than one, set **Source name** on the node. Make sure the account has browse, download and create permissions for that source.
+Point the node at the instance root, e.g. `https://files.example.com`, and give the username/password of a FileBrowser user, or paste a FileBrowser Quantum **API token**. Cascade detects the API automatically. Legacy FileBrowser uses `POST /api/login` and path-based `/api/resources/...` calls. FileBrowser Quantum v2 uses `POST /api/auth/login` with `X-Password`, or accepts an API token directly as a Bearer token; it also uses query-based `/api/resources?path=...&source=...` calls, raw uploads, `isDir` folder creation, a JSON rename payload, and `/api/resources/download?source=...&file=...` downloads. Create a token in Quantum under **Settings → API Management**. Quantum sources are discovered from `/api/settings/sources`; if the account can see more than one, set **Source name** on the node. Make sure the account has browse, download and create permissions for that source.
 
 ### S3-compatible object storage
 
@@ -161,6 +161,10 @@ https://d.terabox.com/file/{id}
 ### HTTP / direct
 
 Set a base URL such as `https://cdn.example.com/files/` and use node paths like `/movie.mp4`. Absolute URLs in a path are also accepted, which makes this a handy generic forwarder. Extra headers are sent upstream by both `/s/` and the resolver (useful for a required `Referer`).
+
+## Files browser
+
+The **Files** page can browse one node at a time or use **All nodes · unified view**. The unified view lists the current folder across every enabled, browsable node, merges folders with the same path, and shows the node(s) where each file is stored. Click a file name to see every storage location, its path and size, then replicate it to any writable node that does not already hold that file. Upload, new-folder and rename/delete actions remain node-specific; select an individual node for those operations.
 
 ## Links
 

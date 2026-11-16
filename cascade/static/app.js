@@ -11,7 +11,7 @@
   function escapeHtml(value) {
     const div = document.createElement("div");
     div.textContent = value === null || value === undefined ? "" : String(value);
-    return div.innerHTML;
+    return div.innerHTML.replace(/"/g, "&quot;").replace(/'/g, "&#39;");
   }
 
   function fmtBytes(num) {
@@ -198,11 +198,14 @@
   /* Files ------------------------------------------------------------------ */
 
   const F = {
+    mode: "node",
     node: C.initialNode || null,
     path: "/",
     caps: [],
     items: [],
     nodeName: "",
+    nodeCount: 0,
+    failedNodes: 0,
     loading: false,
   };
 
@@ -214,9 +217,8 @@
     const nav = $("#breadcrumb");
     if (!nav) return;
     const parts = F.path.split("/").filter(Boolean);
-    const chunks = [
-      `<button type="button" data-crumb="/">${escapeHtml(F.nodeName || "root")}</button>`,
-    ];
+    const rootLabel = F.mode === "all" ? "All nodes" : F.nodeName || "root";
+    const chunks = [`<button type="button" data-crumb="/">${escapeHtml(rootLabel)}</button>`];
     let built = "";
     parts.forEach((part) => {
       built += `/${part}`;
@@ -229,61 +231,190 @@
     });
   }
 
+  function itemLocations(item) {
+    if (Array.isArray(item.locations) && item.locations.length) return item.locations;
+    const nodeId = Number(item.node_id || F.node || 0);
+    if (!nodeId) return [];
+    return [
+      {
+        node_id: nodeId,
+        node_name: item.node_name || F.nodeName,
+        node_kind: item.node_kind || "",
+        path: item.path,
+      },
+    ];
+  }
+
+  function locationLabel(item) {
+    const names = [...new Set(itemLocations(item).map((loc) => loc.node_name).filter(Boolean))];
+    if (!names.length) return F.mode === "all" ? "Unknown" : F.nodeName || "—";
+    if (names.length === 1) return names[0];
+    return `${names.length} nodes`;
+  }
+
+  function locationTitle(item) {
+    return itemLocations(item)
+      .map((loc) => `${loc.node_name || "node"} · ${loc.path || item.path}`)
+      .join("\n");
+  }
+
   function renderFiles() {
     const rows = $("#file-rows");
     if (!rows) return;
     const count = $("#file-count");
-    if (count) count.textContent = `${F.items.length} item${F.items.length === 1 ? "" : "s"}`;
+    if (count) {
+      const suffix = F.failedNodes
+        ? ` · ${F.failedNodes} node${F.failedNodes === 1 ? "" : "s"} unavailable`
+        : "";
+      count.textContent =
+        F.mode === "all"
+          ? `${F.items.length} item${F.items.length === 1 ? "" : "s"} across ${F.nodeCount} node${F.nodeCount === 1 ? "" : "s"}${suffix}`
+          : `${F.items.length} item${F.items.length === 1 ? "" : "s"}`;
+    }
     if (!F.items.length) {
-      rows.innerHTML = `<tr><td colspan="4" class="empty-row">This folder is empty.</td></tr>`;
+      const message = F.mode === "all" ? "No files found across the browsable nodes." : "This folder is empty.";
+      rows.innerHTML = `<tr><td colspan="5" class="empty-row">${message}</td></tr>`;
       return;
     }
     rows.innerHTML = F.items
-      .map((item) => {
+      .map((item, index) => {
         const name = escapeHtml(item.name);
-        const path = escapeHtml(item.path);
+        const location = escapeHtml(locationLabel(item));
+        const locationInfo = escapeHtml(locationTitle(item));
         const actions = [];
-        actions.push(`<button class="btn btn-ghost btn-sm" data-act="${item.is_dir ? "open" : "download"}" data-path="${path}" data-name="${name}" data-size="${item.size || 0}" data-mime="${escapeHtml(item.mime || "")}" title="${item.is_dir ? "Open folder" : "Download"}"><svg class="icon"><use href="#i-${item.is_dir ? "folder" : "download"}"/></svg></button>`);
+        actions.push(`<button class="btn btn-ghost btn-sm" data-act="${item.is_dir ? "open" : "download"}" data-item="${index}" title="${item.is_dir ? "Open folder" : "Download"}"><svg class="icon"><use href="#i-${item.is_dir ? "folder" : "download"}"/></svg></button>`);
         if (!item.is_dir) {
-          actions.push(`<button class="btn btn-ghost btn-sm" data-act="link" data-path="${path}" data-name="${name}" data-size="${item.size || 0}" data-mime="${escapeHtml(item.mime || "")}" title="Create a link"><svg class="icon"><use href="#i-link"/></svg></button>`);
+          actions.push(`<button class="btn btn-ghost btn-sm" data-act="link" data-item="${index}" title="Create a link"><svg class="icon"><use href="#i-link"/></svg></button>`);
           if (C.canReplicate) {
-            actions.push(`<button class="btn btn-ghost btn-sm" data-act="replicate" data-path="${path}" data-name="${name}" title="Replicate"><svg class="icon"><use href="#i-activity"/></svg></button>`);
+            actions.push(`<button class="btn btn-ghost btn-sm" data-act="replicate" data-item="${index}" title="Replicate"><svg class="icon"><use href="#i-activity"/></svg></button>`);
           }
         }
-        if (C.canWrite) {
-          actions.push(`<button class="btn btn-ghost btn-sm" data-act="rename" data-path="${path}" data-name="${name}" title="Rename"><svg class="icon"><use href="#i-edit"/></svg></button>`);
-          actions.push(`<button class="btn btn-ghost btn-sm btn-danger-ghost" data-act="delete" data-path="${path}" data-name="${name}" data-dir="${item.is_dir ? 1 : 0}" title="Delete"><svg class="icon"><use href="#i-trash"/></svg></button>`);
+        if (C.canWrite && F.mode !== "all") {
+          actions.push(`<button class="btn btn-ghost btn-sm" data-act="rename" data-item="${index}" title="Rename"><svg class="icon"><use href="#i-edit"/></svg></button>`);
+          actions.push(`<button class="btn btn-ghost btn-sm btn-danger-ghost" data-act="delete" data-item="${index}" title="Delete"><svg class="icon"><use href="#i-trash"/></svg></button>`);
         }
         return `<tr>
           <td class="cell-main">
-            <button type="button" class="file-name" data-act="${item.is_dir ? "open" : "link"}" data-path="${path}" data-name="${name}" data-size="${item.size || 0}" data-mime="${escapeHtml(item.mime || "")}">
+            <button type="button" class="file-name" data-act="${item.is_dir ? "open" : "inspect"}" data-item="${index}">
               <span class="file-icon ${item.is_dir ? "dir" : ""}"><svg class="icon"><use href="#${fileIcon(item)}"/></svg></span>
               <span class="file-meta"><strong>${name}</strong><small>${item.is_dir ? "folder" : escapeHtml(item.mime || "file")}</small></span>
             </button>
           </td>
           <td class="mono">${item.is_dir ? "—" : fmtBytes(item.size)}</td>
           <td class="muted">${item.modified ? new Date(item.modified * 1000).toLocaleString() : "—"}</td>
+          <td class="muted" title="${locationInfo}"><span class="mono tiny">${location}</span></td>
           <td class="cell-actions"><div class="row-actions">${actions.join("")}</div></td>
         </tr>`;
       })
       .join("");
   }
 
+  function addToUnified(merged, item, node) {
+    const key = `${item.is_dir ? "dir" : "file"}:${item.path}`;
+    let entry = merged.get(key);
+    if (!entry) {
+      entry = {
+        ...item,
+        node_id: Number(node.id),
+        node_name: node.name,
+        node_kind: node.kind,
+        locations: [],
+      };
+      merged.set(key, entry);
+    }
+    entry.locations.push({
+      node_id: Number(node.id),
+      node_name: node.name,
+      node_kind: node.kind,
+      node_kind_label: node.kind_label || node.kind,
+      path: item.path,
+      size: item.size,
+      modified: item.modified,
+    });
+    if (!item.is_dir) {
+      entry.size = Math.max(Number(entry.size) || 0, Number(item.size) || 0);
+    }
+  }
+
+  async function loadAllFiles() {
+    const nodes = (C.nodes || []).filter((node) => (node.caps || []).includes("list"));
+    F.nodeCount = nodes.length;
+    F.failedNodes = 0;
+    F.caps = [];
+    F.nodeName = "All nodes";
+    if (!nodes.length) {
+      F.items = [];
+      return;
+    }
+    const results = await Promise.all(
+      nodes.map(async (node) => {
+        try {
+          const data = await api(
+            `/api/files?node=${encodeURIComponent(node.id)}&path=${encodeURIComponent(F.path)}`
+          );
+          return { node, data };
+        } catch (err) {
+          return { node, error: err };
+        }
+      })
+    );
+    const merged = new Map();
+    let firstError = null;
+    results.forEach(({ node, data, error }) => {
+      if (error) {
+        F.failedNodes += 1;
+        if (!firstError) firstError = error;
+        return;
+      }
+      (data.items || []).forEach((item) => addToUnified(merged, item, node));
+    });
+    F.items = Array.from(merged.values()).sort(
+      (a, b) => Number(b.is_dir) - Number(a.is_dir) || a.name.localeCompare(b.name)
+    );
+    if (!F.items.length && F.failedNodes === nodes.length) {
+      throw firstError || new Error("No nodes could be read");
+    }
+  }
+
+  async function loadNodeFiles() {
+    const data = await api(`/api/files?node=${encodeURIComponent(F.node)}&path=${encodeURIComponent(F.path)}`);
+    F.path = data.path || "/";
+    F.caps = data.capabilities || [];
+    F.nodeName = (data.node && data.node.name) || "";
+    F.nodeCount = 1;
+    F.failedNodes = 0;
+    const node = data.node || { id: Number(F.node), name: F.nodeName, kind: "" };
+    F.items = (data.items || []).map((item) => ({
+      ...item,
+      node_id: Number(node.id),
+      node_name: node.name,
+      node_kind: node.kind,
+      locations: [
+        {
+          node_id: Number(node.id),
+          node_name: node.name,
+          node_kind: node.kind,
+          path: item.path,
+          size: item.size,
+          modified: item.modified,
+        },
+      ],
+    }));
+  }
+
   async function loadFiles() {
-    if (!F.node) return;
+    if (F.mode !== "all" && !F.node) return;
     const rows = $("#file-rows");
-    if (rows) rows.innerHTML = `<tr><td colspan="4" class="empty-row">Loading…</td></tr>`;
+    if (rows) rows.innerHTML = `<tr><td colspan="5" class="empty-row">Loading…</td></tr>`;
     F.loading = true;
     try {
-      const data = await api(`/api/files?node=${encodeURIComponent(F.node)}&path=${encodeURIComponent(F.path)}`);
-      F.path = data.path || "/";
-      F.caps = data.capabilities || [];
-      F.items = data.items || [];
-      F.nodeName = (data.node && data.node.name) || "";
+      if (F.mode === "all") await loadAllFiles();
+      else await loadNodeFiles();
       renderFiles();
       renderBreadcrumb();
     } catch (err) {
-      if (rows) rows.innerHTML = `<tr><td colspan="4" class="empty-row">${escapeHtml(err.message)}</td></tr>`;
+      if (rows) rows.innerHTML = `<tr><td colspan="5" class="empty-row">${escapeHtml(err.message)}</td></tr>`;
+      renderBreadcrumb();
     } finally {
       F.loading = false;
     }
@@ -295,6 +426,9 @@
   }
 
   function openLinkModalForFile(item) {
+    const nodeId = Number(item.node_id || F.node);
+    const nodeName = item.node_name || F.nodeName;
+    if (!nodeId) return toast("This file has no source node", "bad");
     const body = `
       <div class="field"><span>Default delivery</span>
         <select class="select" name="mode">
@@ -311,7 +445,7 @@
       <p class="muted tiny">Both /s/ and /f/ are generated for every link. Forwarding a local file falls back to streaming.</p>`;
     const modal = openModal({
       title: `Share “${item.name}”`,
-      subtitle: F.nodeName ? `On ${F.nodeName}` : "",
+      subtitle: nodeName ? `On ${nodeName}` : "",
       body,
       actions: [
         { label: "Cancel", className: "btn-ghost", onClick: () => modal.close() },
@@ -325,7 +459,7 @@
                 const data = await api("/api/links", {
                   method: "POST",
                   json: {
-                    node_id: Number(F.node),
+                    node_id: nodeId,
                     path: item.path,
                     name: item.name,
                     size: item.size || 0,
@@ -373,6 +507,7 @@
   }
 
   async function uploadFiles(fileList) {
+    if (F.mode === "all") return toast("Choose a single node before uploading", "bad");
     if (!fileList || !fileList.length || !F.node) return;
     if (!C.canWrite) return toast("Only administrators can upload", "bad");
     const status = $("#upload-status");
@@ -410,6 +545,7 @@
   }
 
   function openMkdirModal() {
+    if (F.mode === "all" || !F.node) return toast("Choose a single node first", "bad");
     const modal = openModal({
       title: "New folder",
       body: `<label class="field"><span>Folder name</span><input class="input" name="name" placeholder="media" required></label>`,
@@ -438,6 +574,8 @@
   }
 
   function openRenameModal(item) {
+    const nodeId = Number(item.node_id || F.node);
+    if (!nodeId) return toast("This item has no source node", "bad");
     const modal = openModal({
       title: `Rename “${item.name}”`,
       body: `<label class="field"><span>New name</span><input class="input" name="name" value="${escapeHtml(item.name)}" required></label>`,
@@ -451,7 +589,7 @@
             if (!newName) return toast("Enter a name", "bad");
             await busy(foot.querySelector(".btn-primary"), async () => {
               try {
-                await api("/api/files/rename", { method: "POST", json: { node: Number(F.node), path: item.path, new_name: newName } });
+                await api("/api/files/rename", { method: "POST", json: { node: nodeId, path: item.path, new_name: newName } });
                 modal.close();
                 toast("Renamed");
                 loadFiles();
@@ -466,10 +604,16 @@
   }
 
   async function deleteFile(item) {
-    const ok = await confirmDialog("Delete file", `“${item.name}” will be removed from ${F.nodeName || "the node"}. This cannot be undone.`);
+    const nodeId = Number(item.node_id || F.node);
+    const nodeName = item.node_name || F.nodeName || "the node";
+    if (!nodeId) return toast("This item has no source node", "bad");
+    const ok = await confirmDialog(
+      item.is_dir ? "Delete folder" : "Delete file",
+      `“${item.name}” will be removed from ${nodeName}. This cannot be undone.`
+    );
     if (!ok) return;
     try {
-      await api("/api/files/delete", { method: "POST", json: { node: Number(F.node), path: item.path } });
+      await api("/api/files/delete", { method: "POST", json: { node: nodeId, path: item.path } });
       toast("Deleted");
       loadFiles();
     } catch (err) {
@@ -477,15 +621,85 @@
     }
   }
 
+  function openFileDetails(item) {
+    const locations = itemLocations(item);
+    const first = locations[0] || {};
+    const nodeId = Number(first.node_id || item.node_id || F.node);
+    const locationRows = locations.length
+      ? locations
+          .map(
+            (loc) => `<tr><td><strong>${escapeHtml(loc.node_name || "node")}</strong>${loc.node_kind ? `<br><span class="muted tiny">${escapeHtml(loc.node_kind)}</span>` : ""}</td><td class="mono">${escapeHtml(loc.path || item.path)}</td><td class="mono">${item.is_dir ? "—" : fmtBytes(loc.size || item.size)}</td></tr>`
+          )
+          .join("")
+      : `<tr><td colspan="3" class="empty-row">No storage location recorded.</td></tr>`;
+    const body = `
+      <p class="muted">${item.is_dir ? "Folder" : escapeHtml(item.mime || "File")}${item.is_dir ? "" : ` · ${fmtBytes(item.size)}`}${item.modified ? ` · modified ${new Date(item.modified * 1000).toLocaleString()}` : ""}</p>
+      <h3>Stored on ${locations.length} node${locations.length === 1 ? "" : "s"}</h3>
+      <div class="table-wrap"><table class="table"><thead><tr><th>Node</th><th>Path</th><th>Size</th></tr></thead><tbody>${locationRows}</tbody></table></div>
+      ${item.is_dir ? "" : '<p class="muted tiny">Replication copies this file to another writable node in the background.</p>'}`;
+    let modal;
+    const actions = [{ label: "Close", className: "btn-ghost", onClick: () => modal.close() }];
+    if (item.is_dir) {
+      actions.push({
+        label: "Open folder",
+        className: "btn-primary",
+        onClick: () => {
+          modal.close();
+          navigate(item.path);
+        },
+      });
+    } else {
+      if (nodeId) {
+        actions.push({
+          label: "Download",
+          onClick: () => {
+            window.location.href = `/api/files/raw?node=${encodeURIComponent(nodeId)}&path=${encodeURIComponent(item.path)}`;
+          },
+        });
+      }
+      if (C.canWrite) {
+        actions.push({
+          label: "Create link",
+          onClick: () => {
+            modal.close();
+            openLinkModalForFile(item);
+          },
+        });
+      }
+      if (C.canReplicate) {
+        actions.push({
+          label: "Replicate",
+          className: "btn-primary",
+          onClick: () => {
+            modal.close();
+            openReplicateModal(item);
+          },
+        });
+      }
+    }
+    modal = openModal({
+      title: item.name,
+      subtitle: `${item.is_dir ? "Folder" : "File"} · ${locations.length} location${locations.length === 1 ? "" : "s"}`,
+      wide: true,
+      body,
+      actions,
+    });
+  }
+
   function openReplicateModal(item) {
+    const sourceNode = Number(item.node_id || F.node);
+    if (!sourceNode) return toast("This file has no source node", "bad");
+    const sourceName = item.node_name || F.nodeName || "node";
+    const existing = new Set(itemLocations(item).map((loc) => Number(loc.node_id)));
+    if (!existing.size) existing.add(sourceNode);
     const targets = (C.nodes || []).filter(
-      (node) => node.id !== Number(F.node) && (node.caps || []).includes("write")
+      (node) => (node.caps || []).includes("write") && !existing.has(Number(node.id))
     );
     if (!targets.length) {
-      return toast("No writable target nodes connected", "bad");
+      return toast("This file is already on every writable node, or there is no other writable node", "bad");
     }
     const body = `
-      <p class="muted">Copy <strong>${escapeHtml(item.name)}</strong> to another node. The transfer runs in the background.</p>
+      <p class="muted">Copy <strong>${escapeHtml(item.name)}</strong> from ${escapeHtml(sourceName)} (<span class="mono">${escapeHtml(item.path)}</span>) to another node. The transfer runs in the background.</p>
       <label class="field"><span>Target node</span>
         <select class="select" name="target">
           ${targets.map((node) => `<option value="${node.id}">${escapeHtml(node.name)} · ${escapeHtml(node.kind)}</option>`).join("")}
@@ -497,7 +711,7 @@
       <p class="muted tiny">Existing files with the same name are overwritten.</p>`;
     const modal = openModal({
       title: "Replicate file",
-      subtitle: F.nodeName ? `From ${F.nodeName}` : "",
+      subtitle: `From ${sourceName} · ${item.path}`,
       body,
       actions: [
         { label: "Cancel", className: "btn-ghost", onClick: () => modal.close() },
@@ -510,7 +724,7 @@
                 const data = await api("/api/files/replicate", {
                   method: "POST",
                   json: {
-                    node: Number(F.node),
+                    node: sourceNode,
                     path: item.path,
                     targets: [
                       {
@@ -560,14 +774,30 @@
 
   function initFiles() {
     if (!$("#file-rows")) return;
+    const syncModeControls = () => {
+      const single = F.mode !== "all";
+      $$("[data-single-node-only]").forEach((element) => {
+        element.hidden = !single;
+      });
+      const allHint = $("#all-nodes-hint");
+      if (allHint) allHint.hidden = single;
+    };
     const select = $("#node-select");
     if (select) {
       select.addEventListener("change", () => {
-        F.node = select.value;
+        if (select.value === "all") {
+          F.mode = "all";
+          F.node = null;
+        } else {
+          F.mode = "node";
+          F.node = select.value;
+        }
         F.path = "/";
+        syncModeControls();
         loadFiles();
       });
     }
+    syncModeControls();
     const up = $("#btn-up");
     if (up) {
       up.addEventListener("click", () => {
@@ -612,17 +842,16 @@
     rows.addEventListener("click", (event) => {
       const button = event.target.closest("[data-act]");
       if (!button) return;
-      const item = {
-        path: button.dataset.path,
-        name: button.dataset.name,
-        size: Number(button.dataset.size || 0),
-        mime: button.dataset.mime || "",
-        is_dir: button.closest("tr")?.querySelector(".file-icon.dir") !== null,
-      };
+      const item = F.items[Number(button.dataset.item)];
+      if (!item) return;
       const action = button.dataset.act;
+      const nodeId = Number(item.node_id || F.node);
       if (action === "open") navigate(item.path);
-      else if (action === "download") window.location.href = `/api/files/raw?node=${encodeURIComponent(F.node)}&path=${encodeURIComponent(item.path)}`;
-      else if (action === "link") openLinkModalForFile(item);
+      else if (action === "inspect") openFileDetails(item);
+      else if (action === "download") {
+        if (!nodeId) return toast("This file has no source node", "bad");
+        window.location.href = `/api/files/raw?node=${encodeURIComponent(nodeId)}&path=${encodeURIComponent(item.path)}`;
+      } else if (action === "link") openLinkModalForFile(item);
       else if (action === "rename") openRenameModal(item);
       else if (action === "replicate") openReplicateModal(item);
       else if (action === "delete") deleteFile(item);
